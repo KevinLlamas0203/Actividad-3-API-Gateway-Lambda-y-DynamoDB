@@ -1,0 +1,76 @@
+lambda_function.py
+
+
+import base64
+import json
+import os
+from decimal import Decimal
+
+import boto3
+from botocore.exceptions import ClientError
+
+TABLE_NAME = os.environ.get("TABLE_NAME", "datos-esp32")
+table = boto3.resource("dynamodb").Table(TABLE_NAME)
+
+TEXTOS = ["device_id", "shipment_id", "timestamp"]
+NUMERICOS = ["temperature_c", "humidity_pct", "latitude", "longitude", "speed_kmh"]
+
+
+def responder(status, cuerpo, es_proxy):
+    # Con proxy devuelve el formato de API Gateway; sin proxy, solo el cuerpo.
+    if es_proxy:
+        return {
+            "statusCode": status,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(cuerpo),
+        }
+    return cuerpo
+
+
+def lambda_handler(event, context):
+    # Con integracion proxy el JSON llega como texto en event["body"];
+    # sin proxy, el evento ya es el JSON.
+    es_proxy = "body" in event
+
+    if es_proxy:
+        raw = event.get("body") or ""
+        if event.get("isBase64Encoded"):
+            raw = base64.b64decode(raw).decode("utf-8")
+    else:
+        raw = json.dumps(event)
+
+    # DynamoDB no acepta float, por eso parse_float=Decimal
+    try:
+        data = json.loads(raw, parse_float=Decimal)
+    except json.JSONDecodeError:
+        return responder(400, {"error": "JSON invalido"}, es_proxy)
+
+    if not isinstance(data, dict):
+        return responder(400, {"error": "Se esperaba un objeto JSON"}, es_proxy)
+
+    # Validacion
+    for campo in TEXTOS:
+        if not isinstance(data.get(campo), str) or not data[campo]:
+            return responder(400, {"error": "Falta o es invalido: " + campo}, es_proxy)
+    for campo in NUMERICOS:
+        if not isinstance(data.get(campo), (int, Decimal)):
+            return responder(400, {"error": "Falta o es invalido: " + campo}, es_proxy)
+
+    if not (-90 <= data["latitude"] <= 90 and -180 <= data["longitude"] <= 180):
+        return responder(400, {"error": "Coordenadas fuera de rango"}, es_proxy)
+    if not (0 <= data["humidity_pct"] <= 100):
+        return responder(400, {"error": "Humedad fuera de rango"}, es_proxy)
+
+    # La tabla datos-esp32 usa "id" (String) como clave de particion.
+    # Se genera con dispositivo + timestamp: unico por lectura y los reintentos
+    # del mismo dato no crean duplicados.
+    item = {"id": data["device_id"] + "#" + data["timestamp"]}
+    item.update({k: data[k] for k in TEXTOS + NUMERICOS})
+
+    try:
+        table.put_item(Item=item)
+    except ClientError as e:
+        print("Error DynamoDB:", e)
+        return responder(500, {"error": "No se pudo guardar el dato"}, es_proxy)
+
+    return responder(201, {"ok": True, "id": item["id"]}, es_proxy)
